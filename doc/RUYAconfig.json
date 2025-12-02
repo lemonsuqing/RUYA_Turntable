@@ -1,0 +1,7 @@
+{
+  "COMPort": "COM11",
+  "Baudrate": 38400,
+  "UartAsciiStart": "$1",
+  "UartAsciiStop": "\r\n",
+  "Protocol": "RUYA"
+}
