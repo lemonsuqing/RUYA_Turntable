@@ -1,6 +1,6 @@
 {
-  "COMPort": "COM11",
-  "Baudrate": 38400,
+  "COMPort": "COM5",
+  "Baudrate": 115200,
   "UartAsciiStart": "$1",
   "UartAsciiStop": "\r\n",
   "Protocol": "RUYA"
