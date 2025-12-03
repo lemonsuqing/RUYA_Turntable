@@ -12,23 +12,20 @@ DEFAULT_BAUDRATE = 115200
 SUPPORTED_BAUDRATES = [9600, 19200, 38400, 57600, 115200, 230400]
 
 # -------------------------- 全局变量 --------------------------
-# UI更新队列
 ui_queue = queue.Queue(maxsize=1)
+cmd_execution_lock = threading.Lock() # 互斥锁，防止指令冲突
 
-# 指令执行锁（确保一个指令执行完再执行下一个，实现“无缝切换”排队）
-cmd_execution_lock = threading.Lock()
-
-# 状态标志
 is_listening = False
 is_connected = False
 is_homing = False
 
 # 全局最新状态 (原子操作更新)
 global_state = {
-    "status": "0",  # 默认为0(释放)
+    "status": "0",  # 初始默认为释放
     "alarm": "0",
     "angle": 0.0,
-    "seq": "00"
+    "seq": "00",
+    "last_update_time": 0
 }
 
 ser = None
@@ -61,26 +58,20 @@ def connect_serial(com_port: str, baudrate: int) -> bool:
 
 def disconnect_serial(force: bool = False) -> None:
     global ser, is_connected, is_listening, is_homing
-    
     is_listening = False
     is_homing = False
     
     if is_connected and ser and ser.is_open:
         try:
-            # 退出前尝试停车并释放
-            ser.write(b"$1st\r\n")
+            ser.write(b"$1st\r\n") # 尝试停车
             time.sleep(0.05)
-            ser.write(b"$1mo=0\r\n")
-        except:
-            pass
-        try:
-            ser.close()
-        except:
-            pass
+            ser.write(b"$1mo=0\r\n") # 尝试释放
+        except: pass
+        try: ser.close()
+        except: pass
     is_connected = False
 
 def send_raw_bytes(cmd_str: str):
-    """ 最底层的发送，不带任何等待逻辑 """
     global ser
     if is_connected and ser:
         try:
@@ -91,10 +82,9 @@ def send_raw_bytes(cmd_str: str):
             return False
     return False
 
-# -------------------------- 监听线程 --------------------------
+# -------------------------- 监听线程 (高频刷新) --------------------------
 def parse_status(data: str):
-    if len(data) < 14 or not data.startswith("$1"):
-        return None
+    if len(data) < 14 or not data.startswith("$1"): return None
     try:
         content = data[2:].strip()
         alarm = content[0]
@@ -112,29 +102,28 @@ def listen_serial_loop():
     while is_listening and ser and ser.is_open:
         try:
             if ser.in_waiting:
-                # 快速读取
                 raw = ser.read(ser.in_waiting).decode('ascii', errors='replace')
                 buffer += raw
                 if '\n' in buffer:
                     lines = buffer.split('\n')
                     buffer = lines[-1]
-                    # 找最新的一帧
                     for line in reversed(lines[:-1]):
                         line = line.strip()
                         if line.startswith('$1') and len(line) >= 14:
                             res = parse_status(line)
                             if res:
-                                # 更新全局变量 (Python字典更新是线程安全的)
+                                # 更新全局状态
                                 global_state.update(res)
+                                global_state["last_update_time"] = time.time()
                                 
-                                # 推送给UI
+                                # 推送UI
                                 if ui_queue.full():
                                     try: ui_queue.get_nowait()
                                     except: pass
                                 ui_queue.put(res)
                             break
             else:
-                time.sleep(0.001) # 极短睡眠，保证CPU不占满
+                time.sleep(0.001) # 1ms 微休眠，极速响应
         except:
             time.sleep(0.1)
 
@@ -143,91 +132,103 @@ def start_listen_thread():
     listen_thread = threading.Thread(target=listen_serial_loop, daemon=True)
     listen_thread.start()
 
-# -------------------------- 核心逻辑：自动流转控制 --------------------------
-
-def wait_for_status(target_status_list, timeout=1.0):
-    """ 等待转台进入指定状态之一 """
-    start_t = time.time()
-    while time.time() - start_t < timeout:
-        if global_state["status"] in target_status_list:
-            return True
-        time.sleep(0.005) # 5ms 轮询
-    return False
+# -------------------------- 核心：V1.9 极速状态流转 --------------------------
 
 def execute_command_sequence(cmd_str, status_msg_updater):
     """
-    【后台线程执行】
-    自动处理：停车 -> 等待伺服状态(1#) -> 发送新指令
+    V1.9 极速切换逻辑：
+    1. 判断当前状态。
+    2. 若需停车，发送指令。
+    3. 进入 10ms 高频检测循环：
+       - 一旦检测到状态变 '1'，立即 break 并发送指令 (零延迟)。
+       - 若状态长时间未变，自动补发停车指令 (防丢包)。
     """
     def task():
-        with cmd_execution_lock: # 互斥锁：防止连点导致逻辑混乱，排队执行
-            status_msg_updater("⌛ 正在切换模式...")
-            
-            # 1. 检查当前状态
+        with cmd_execution_lock: # 锁住，确保指令按顺序执行
             current = global_state["status"]
             
-            # 如果是释放状态(0)，且指令不是使能，则无法执行
-            # (但在UI层我们会禁用按钮，这里做个双重保险)
+            # 1. 检查是否释放
             if current == '0' and "mo=1" not in cmd_str:
-                status_msg_updater("⚠️ 错误：电机未使能")
+                status_msg_updater("⚠️ 错误：请先使能电机")
                 return
 
-            # 2. 如果当前不是伺服状态(1#)且不是释放(0#)，说明在运行中，需要先停车
-            if current not in ['0', '1']:
-                send_raw_bytes("st")
-                # 等待回到伺服状态(1)
-                # 协议：停车后会变8(停车中) -> 1(伺服)
-                if not wait_for_status(['1', '0'], timeout=2.0):
-                    status_msg_updater("⚠️ 切换超时：转台未停止")
+            # 2. 如果已经在伺服状态(1)，直接秒发
+            if current == '1':
+                if send_raw_bytes(cmd_str):
+                    # status_msg_updater(f"✅ 发送: {cmd_str}") # 可选：不弹这个，直接发
+                    pass
+                return
+
+            # 3. 需要切换模式：先发停车
+            status_msg_updater("⏳ 正在停止转台...")
+            send_raw_bytes("st")
+            
+            # --- 主动轮询循环 ---
+            start_t = time.time()
+            last_resend_t = time.time()
+            success = False
+            
+            while time.time() - start_t < 8.0: # 最长允许8秒刹车时间
+                s = global_state["status"]
+                
+                # [核心判定]：只要状态变成 1 (伺服) 或 0 (释放)，立刻跳出
+                if s == '1':
+                    success = True
+                    break
+                if s == '0':
+                    status_msg_updater("⚠️ 异常：电机被释放")
                     return
-            
-            # 3. 如果当前是释放(0)且指令是运动指令，需要先使能 (根据需求，这里不自动使能，由用户点)
-            # 所以假设到了这里，状态应该是 1
-            
-            # 4. 发送最终指令
+
+                # [智能补发]：如果还在运行状态(不是1也不是8)，每0.5秒补发一次st
+                # 这能有效解决“显示超时”的问题
+                if s not in ['1', '8', '0']:
+                    if time.time() - last_resend_t > 0.5:
+                        send_raw_bytes("st") # 补发
+                        last_resend_t = time.time()
+                
+                # 极速轮询：只睡 10ms
+                time.sleep(0.01)
+
+            if not success:
+                status_msg_updater(f"❌ 切换失败 (卡在状态 {global_state['status']})")
+                return
+
+            # 4. 成功停稳，立即发送新指令
             if send_raw_bytes(cmd_str):
-                status_msg_updater(f"✅ 指令已发送")
+                status_msg_updater(f"✅ 切换完成，指令执行")
             else:
                 status_msg_updater("❌ 发送失败")
 
-    # 启动后台线程，不阻塞UI
     threading.Thread(target=task, daemon=True).start()
 
 # -------------------------- 回零任务 --------------------------
 def homing_logic(status_updater, finish_callback):
     global is_homing
     
-    # 1. 停止并归位
+    # 暴力停车
     send_raw_bytes("st")
-    wait_for_status(['1'], timeout=2.0)
+    time.sleep(0.2)
     
-    # 2. 发送回零
     send_raw_bytes("1")
-    status_updater(">>> 正在回零... (点击停车可终止)")
+    status_updater(">>> 正在回零... (点击停车可取消)")
     
     stable_start = None
     
-    # 3. 循环判定
     while is_homing:
-        # 实时检查角度
         ang = global_state["angle"]
-        
-        # 判定归零 (角度极小)
+        # 判定归零 (0.01度以内)
         if abs(ang) <= 0.01:
             if stable_start is None:
                 stable_start = time.time()
-            elif time.time() - stable_start > 0.5: # 稳定0.5秒
+            elif time.time() - stable_start > 0.5:
                 status_updater("✅ 回零成功！")
                 is_homing = False
                 break
         else:
             stable_start = None
             
-        time.sleep(0.1)
-        
-        # 安全退出：如果用户强制断开或状态变回空闲
-        if not is_connected:
-            break
+        time.sleep(0.05) # 提高采样率
+        if not is_connected: break
             
     finish_callback()
 
@@ -235,14 +236,13 @@ def start_homing_task(status_updater, finish_callback):
     global is_homing
     if is_homing: return
     is_homing = True
-    # 启动独立线程
     threading.Thread(target=homing_logic, args=(status_updater, finish_callback), daemon=True).start()
 
 # -------------------------- GUI 界面 --------------------------
 class TurntableGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("单轴转台控制系统 V1.7 (无缝切换版)")
+        self.root.title("单轴转台控制系统 V1.9 (极速主动轮询版)")
         self.root.geometry("920x700")
         
         self.com_var = tk.StringVar()
@@ -263,7 +263,7 @@ class TurntableGUI:
         self.update_ui_loop()
 
     def setup_ui(self):
-        # 1. 顶部连接
+        # 顶部
         top = ttk.Frame(self.root, padding=10)
         top.pack(fill=tk.X)
         ttk.Label(top, text="端口:").pack(side=tk.LEFT)
@@ -272,17 +272,14 @@ class TurntableGUI:
         ttk.Label(top, text="波特率:").pack(side=tk.LEFT)
         self.cb_baud = ttk.Combobox(top, textvariable=self.baud_var, values=SUPPORTED_BAUDRATES, width=8)
         self.cb_baud.pack(side=tk.LEFT, padx=5)
-        
         self.btn_connect = tk.Button(top, text="🔌 连接设备", bg="#e1e1e1", command=self.toggle_connect, width=12)
         self.btn_connect.pack(side=tk.LEFT, padx=15)
 
-        # 2. 状态显示
+        # 状态
         stat_frame = ttk.LabelFrame(self.root, text="实时监控", padding=15)
         stat_frame.pack(fill=tk.X, padx=10, pady=5)
-        
         self.lbl_angle = ttk.Label(stat_frame, text="0.0000°", font=("Helvetica", 42, "bold"), foreground="#ccc")
         self.lbl_angle.pack(side=tk.LEFT, padx=20)
-        
         info_f = ttk.Frame(stat_frame)
         info_f.pack(side=tk.LEFT, padx=20)
         self.lbl_state_txt = ttk.Label(info_f, text="状态: 未连接", font=("Arial", 12))
@@ -290,34 +287,28 @@ class TurntableGUI:
         self.lbl_mode_txt = ttk.Label(info_f, text="模式: --", font=("Arial", 12, "bold"))
         self.lbl_mode_txt.pack(anchor=tk.W)
 
-        # 3. 参数区
+        # 参数
         param_f = ttk.LabelFrame(self.root, text="参数设置", padding=10)
         param_f.pack(fill=tk.X, padx=10, pady=5)
-        
         ttk.Label(param_f, text="方向:").grid(row=0, column=0, sticky=tk.W)
         ttk.Radiobutton(param_f, text="顺时针(CW)", variable=self.var_dir, value=0).grid(row=0, column=1)
         ttk.Radiobutton(param_f, text="逆时针(CCW)", variable=self.var_dir, value=1).grid(row=0, column=2)
-        
         ttk.Label(param_f, text="加速度(°/s²):").grid(row=1, column=0, sticky=tk.W, pady=5)
         ttk.Entry(param_f, textvariable=self.var_acc, width=8).grid(row=1, column=1, sticky=tk.W)
         ttk.Label(param_f, text="速度(°/s):").grid(row=1, column=2, sticky=tk.W)
         ttk.Entry(param_f, textvariable=self.var_spd, width=8).grid(row=1, column=3, sticky=tk.W)
-        
         ttk.Label(param_f, text="角度(°):").grid(row=2, column=0, sticky=tk.W, pady=5)
         ttk.Entry(param_f, textvariable=self.var_ang, width=8).grid(row=2, column=1, sticky=tk.W)
         ttk.Label(param_f, text="圈数:").grid(row=2, column=2, sticky=tk.W)
         ttk.Entry(param_f, textvariable=self.var_loop, width=8).grid(row=2, column=3, sticky=tk.W)
-        
         ttk.Label(param_f, text="摇摆幅度(°):").grid(row=3, column=0, sticky=tk.W, pady=5)
         ttk.Entry(param_f, textvariable=self.var_swing_amp, width=8).grid(row=3, column=1, sticky=tk.W)
         ttk.Label(param_f, text="摇摆频率(Hz):").grid(row=3, column=2, sticky=tk.W)
         ttk.Entry(param_f, textvariable=self.var_swing_freq, width=8).grid(row=3, column=3, sticky=tk.W)
 
-        # 4. 按钮控制区
+        # 按钮
         ctrl_f = ttk.LabelFrame(self.root, text="控制面板", padding=10)
         ctrl_f.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # 第一排：基础
         row1 = ttk.Frame(ctrl_f)
         row1.pack(fill=tk.X, pady=5)
         self.btn_en = ttk.Button(row1, text="⚡ 伺服使能", command=lambda: send_raw_bytes("mo=1"))
@@ -326,11 +317,8 @@ class TurntableGUI:
         self.btn_dis.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
         self.btn_stop = tk.Button(row1, text="🛑 立即停车", bg="#ffcccc", command=self.do_stop_all)
         self.btn_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=3)
-
-        # 第二排：运动 (使用 tk.Button 以便支持禁用变色，或者 ttk 也可以)
         row2 = ttk.Frame(ctrl_f)
         row2.pack(fill=tk.X, pady=5)
-        
         self.btn_pos = ttk.Button(row2, text="位置模式", command=self.do_pos_mode)
         self.btn_pos.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
         self.btn_spd = ttk.Button(row2, text="速率模式", command=self.do_spd_mode)
@@ -341,13 +329,10 @@ class TurntableGUI:
         self.btn_swing.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
         self.btn_home = ttk.Button(row2, text="🏠 回零", command=self.do_homing)
         self.btn_home.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
-
         ttk.Label(self.root, textvariable=self.status_msg, relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
 
         self.motion_btns = [self.btn_pos, self.btn_spd, self.btn_mc, self.btn_swing, self.btn_home, self.btn_dis]
 
-    # --- 逻辑处理 ---
-    
     def refresh_ports(self):
         pts = get_available_com_ports()
         self.cb_port['values'] = pts
@@ -362,11 +347,10 @@ class TurntableGUI:
             else:
                 messagebox.showerror("错误", "无法打开串口")
         else:
-            self.do_stop_all() # 断开前停车
+            self.do_stop_all()
             disconnect_serial()
             self.status_msg.set("⚠️ 已断开连接")
             self.btn_connect.config(text="🔌 连接设备", bg="#e1e1e1")
-            # 重置UI
             self.lbl_angle.config(text="0.0000°", foreground="#ccc")
             self.lbl_state_txt.config(text="状态: 未连接", foreground="black")
             self.lbl_mode_txt.config(text="模式: --")
@@ -374,33 +358,27 @@ class TurntableGUI:
 
     def set_motion_enable(self, enable):
         state = tk.NORMAL if enable else tk.DISABLED
-        for btn in self.motion_btns:
-            btn.config(state=state)
-        # 使能按钮与运动按钮互斥 (如果运动可用，说明已使能，则禁用使能按钮，避免重复点)
+        for btn in self.motion_btns: btn.config(state=state)
         self.btn_en.config(state=tk.DISABLED if enable else tk.NORMAL)
 
     def do_stop_all(self):
         global is_homing
-        is_homing = False # 终止回零标志
-        # 停车指令直接发，不走排队，最高优先级
+        is_homing = False
         send_raw_bytes("st")
         self.status_msg.set("🛑 已发送停车")
 
     def do_homing(self):
         if is_homing: return
-        self.set_motion_enable(False) # 锁定按钮
+        self.set_motion_enable(False)
         start_homing_task(
             status_updater=lambda m: self.status_msg.set(m),
-            finish_callback=lambda: self.status_msg.set("回零结束") 
-            # 按钮恢复交给 loop 自动判断
+            finish_callback=lambda: self.status_msg.set("回零结束")
         )
 
-    # 发送指令的通用入口 (带参数校验)
     def send_cmd_safe(self, cmd):
         if is_homing:
             self.status_msg.set("⚠️ 回零中，请先停车")
             return
-        # 调用后台排队执行
         execute_command_sequence(cmd, lambda m: self.status_msg.set(m))
 
     def get_p(self):
@@ -431,17 +409,14 @@ class TurntableGUI:
         except:
             messagebox.showerror("错误", "参数无效")
 
-    # --- UI 刷新循环 ---
     def update_ui_loop(self):
         try:
-            # 1. 更新数据显示
             if not ui_queue.empty():
                 state = ui_queue.get_nowait()
                 angle = state['angle']
                 status = state['status']
                 alarm = state['alarm']
                 
-                # 角度颜色
                 self.lbl_angle.config(text=f"{angle:.4f}°")
                 if alarm != '0':
                     self.lbl_angle.config(foreground="red")
@@ -450,23 +425,17 @@ class TurntableGUI:
                     self.lbl_angle.config(foreground="#0055ff")
                     self.lbl_state_txt.config(text="状态: 正常", foreground="green")
 
-                # 模式文本
                 s_map = {'0':'释放', '1':'伺服保持', '2':'回零中', '3':'位置运行', '4':'速率运行', 
                          '5':'速率稳定', '6':'摇摆运行', '7':'摇摆稳定', '8':'停车中', '9':'多圈运行'}
                 self.lbl_mode_txt.config(text=f"模式: {s_map.get(status, status)}")
 
-                # 2. 按钮互斥逻辑 (核心)
-                if not is_homing: # 回零时不干涉
+                if not is_homing:
                     if status == '0':
-                        # 释放状态：禁用运动，启用使能
                         self.set_motion_enable(False)
                         self.lbl_state_txt.config(text="提示: 请点击使能", foreground="orange")
                     else:
-                        # 运行/伺服状态：启用运动，禁用使能
                         self.set_motion_enable(True)
-
-        except:
-            pass
+        except: pass
         self.root.after(20, self.update_ui_loop)
 
     def on_close(self):
