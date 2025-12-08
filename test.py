@@ -23,7 +23,6 @@ class TurntableDriver(ABC):
         self.port = config.get("COMPort")
         self.baud = config.get("Baudrate")
         self.is_connected = False
-        # 初始状态设为 None，强制必须读到数据才算有效
         self.latest_state = {"status": None, "angle": 0.0, "alarm": "0"}
         self.lock = threading.Lock()
         
@@ -52,24 +51,18 @@ class TurntableDriver(ABC):
     def cmd_stop(self) -> bool: pass
 
     @abstractmethod
+    def cmd_reset(self) -> bool: 
+        """回零指令"""
+        pass
+
+    @abstractmethod
     def cmd_speed_run(self, acc, speed) -> bool: pass
 
     @abstractmethod
-    def cmd_position_run(self, dir_code, acc, speed, target_angle) -> bool:
-        """
-        Mode 2: 位置模式
-        dir_code: 0=顺时针, 1=逆时针
-        target_angle: 绝对目标角度 (0-360)
-        """
-        pass
+    def cmd_position_run(self, dir_code, acc, speed, target_angle) -> bool: pass
 
     @abstractmethod
-    def cmd_multi_run(self, dir_code, acc, speed, target_angle, loops) -> bool:
-        """
-        Mode 5: 多圈模式
-        loops: 圈数 (0-99)
-        """
-        pass
+    def cmd_multi_run(self, dir_code, acc, speed, target_angle, loops) -> bool: pass
 
     @abstractmethod
     def get_current_state(self): pass
@@ -112,7 +105,6 @@ class RuyaDriver(TurntableDriver):
                 self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
                 self.listen_thread.start()
                 
-                # 等待直到收到第一帧有效数据
                 retry = 0
                 while self.latest_state["status"] is None and retry < 20:
                     time.sleep(0.1)
@@ -217,7 +209,7 @@ class RuyaDriver(TurntableDriver):
                 time.sleep(0.5) 
                 continue
             if s in ['2', '3', '4', '5', '6', '7', '9']:
-                print_resp("Stopping previous motion to change mode...")
+                print_resp("Stopping previous motion...")
                 self._send_raw("st")
                 time.sleep(0.2)
                 continue
@@ -234,6 +226,13 @@ class RuyaDriver(TurntableDriver):
     def cmd_free(self) -> bool: return self._send_raw("mo=0")
     def cmd_stop(self) -> bool: return self._send_raw("st")
 
+    def cmd_reset(self) -> bool:
+        """Mode: Reset/Homing"""
+        # 回零也需要转台准备好（例如不能正在高速旋转）
+        if not self._ensure_ready_to_move(): return False
+        # 协议指令: 1
+        return self._send_raw("1")
+
     def cmd_speed_run(self, acc, speed) -> bool:
         if not self._ensure_ready_to_move(): return False
         direction = 0 
@@ -243,27 +242,19 @@ class RuyaDriver(TurntableDriver):
         return self._send_raw(cmd)
 
     def cmd_position_run(self, dir_code, acc, speed, target_angle) -> bool:
-        """Mode 2: 标准位置模式"""
         if not self._ensure_ready_to_move(): return False
-        
         acc_clamped = max(1, min(1000, int(acc)))
         spd_clamped = max(0.0001, min(1000.0, float(speed)))
         ang_clamped = float(target_angle)
-        
-        # 格式: 2{dir}{acc}{spd}{angle}
         cmd = f"2{dir_code}{acc_clamped:04d}{spd_clamped:09.4f}{ang_clamped:08.4f}"
         return self._send_raw(cmd)
 
     def cmd_multi_run(self, dir_code, acc, speed, target_angle, loops) -> bool:
-        """Mode 5: 多圈模式 (New!)"""
         if not self._ensure_ready_to_move(): return False
-        
         acc_clamped = max(1, min(1000, int(acc)))
         spd_clamped = max(0.0001, min(1000.0, float(speed)))
         ang_clamped = float(target_angle)
-        loops_clamped = max(0, min(99, int(loops))) # 协议限制2位数字 (00-99)
-        
-        # 格式: 5{dir}{acc}{spd}{angle}{loops}
+        loops_clamped = max(0, min(99, int(loops)))
         cmd = f"5{dir_code}{acc_clamped:04d}{spd_clamped:09.4f}{ang_clamped:08.4f}{loops_clamped:02d}"
         return self._send_raw(cmd)
 
@@ -275,33 +266,16 @@ class RuyaDriver(TurntableDriver):
 # 3. 业务逻辑核心 (Calculation)
 # ==========================================
 def calculate_move_params(current_angle, input_delta):
-    """
-    核心算法：根据当前角度和增量，计算方向、圈数、绝对目标角度
-    """
-    # 1. 确定方向
-    # 增量 > 0: 顺时针(0); 增量 < 0: 逆时针(1)
     direction = 0 if input_delta >= 0 else 1
-    
-    # 2. 计算绝对增量值
     abs_delta = abs(input_delta)
-    
-    # 3. 计算圈数 (整数部分)
     loops = int(abs_delta // 360)
-    
-    # 4. 计算剩余角度 (小数部分)
     remainder = abs_delta % 360
     
-    # 5. 计算目标绝对角度
-    # 如果是顺时针，目标 = 当前 + 余数
-    # 如果是逆时针，目标 = 当前 - 余数
     if direction == 0:
         target_abs = current_angle + remainder
     else:
         target_abs = current_angle - remainder
         
-    # 6. 归一化目标角度到 [0, 360)
-    # 比如算出来是 370，其实是 10度
-    # 比如算出来是 -30，其实是 330度
     if target_abs >= 360.0:
         target_abs -= 360.0
     elif target_abs < 0.0:
@@ -319,7 +293,7 @@ def main():
     parser.add_argument("--command", required=True)
     parser.add_argument("--acc", type=float)
     parser.add_argument("--speed", type=float)
-    parser.add_argument("--angle", type=float) # 注意：这里现在代表“增量”
+    parser.add_argument("--angle", type=float)
     parser.add_argument("--printScreen", type=str, default="False")
     parser.add_argument("--SaveCSVFile", type=str)
 
@@ -356,6 +330,46 @@ def main():
         elif cmd == "Stop":
             if driver.cmd_stop(): print_resp("OK")
             else: print_resp("Error")
+            
+        # === 新增：Reset (回零) ===
+        elif cmd == "Reset":
+            force_cleanup = True # 回零是阻塞操作，如果被打断建议清理
+            if driver.cmd_reset():
+                print_resp("OK")
+                
+                # 回零可能需要很长时间，逻辑类似 Position Run
+                time.sleep(1.0) # 等待开始转动
+                wait_start = time.time()
+                timeout = 180 # 假设回零最慢需要3分钟
+                completed = False
+                
+                while time.time() - wait_start < timeout:
+                    s = driver.get_current_state()
+                    status = s['status']
+                    current_angle = s['angle']
+                    
+                    # 判定回零成功条件：
+                    # 1. 状态必须是 静止(1) 或 空闲(0)
+                    # 2. 角度必须极其接近 0.0 (误差 < 0.1度)
+                    if status in ['1', '0'] and abs(current_angle) < 0.1:
+                        # 二次确认
+                        time.sleep(0.5)
+                        s2 = driver.get_current_state()
+                        if s2['status'] in ['1', '0'] and abs(s2['angle']) < 0.1:
+                            completed = True
+                            break
+                    
+                    time.sleep(0.2)
+
+                if completed:
+                    print_resp("Complete")
+                    final = driver.get_current_state()
+                    print_resp(f"POSTAIL {final['angle']:.4f}")
+                    force_cleanup = False
+                else:
+                    print_resp("Error: Timeout or Not at Zero")
+            else:
+                print_resp("Error: Send Reset failed")
 
         elif cmd == "Speed Run":
             if args.acc is None or args.speed is None:
@@ -370,52 +384,37 @@ def main():
                 else:
                     print_resp("Error")
 
-        # === 核心修改：Position Run 智能逻辑 ===
         elif cmd == "Position Run":
             force_cleanup = True 
             
             if args.acc is None or args.speed is None or args.angle is None:
                 print_resp("Error: Missing params")
             else:
-                # 1. 获取当前状态
                 state = driver.get_current_state()
                 current_angle = state['angle']
                 input_delta = args.angle
                 
                 print_resp(f"Current: {current_angle:.4f} | Input Delta: {input_delta}")
                 
-                # 2. 计算目标参数
-                # dir_code: 0=CW, 1=CCW
-                # loops: 圈数
-                # target_abs: 0-360的绝对目标位置
                 dir_code, loops, target_abs = calculate_move_params(current_angle, input_delta)
                 
                 print_resp(f"Calc Result -> Dir: {dir_code} (0=CW/1=CCW) | Loops: {loops} | Target Abs: {target_abs:.4f}")
                 
-                # 3. 智能选择指令
                 success = False
                 if loops == 0:
-                    # 圈数为0，使用普通位置模式 (Mode 2)
                     print_resp("Action: Single Turn Mode (Mode 2)")
                     success = driver.cmd_position_run(dir_code, args.acc, args.speed, target_abs)
                 else:
-                    # 圈数>0，使用多圈模式 (Mode 5)
-                    # 注意：协议限制最大99圈，如果这里算出100圈，可能需要做限幅或分段
-                    if loops > 99:
-                        print_resp("Warning: Loops > 99, capped at 99 by protocol limit.")
+                    if loops > 99: print_resp("Warning: Loops > 99, capped at 99.")
                     print_resp(f"Action: Multi Turn Mode (Mode 5) - {loops} loops")
                     success = driver.cmd_multi_run(dir_code, args.acc, args.speed, target_abs, loops)
 
-                # 4. 等待到位逻辑 (通用)
                 if success:
                     print_resp("OK")
-                    print_resp(f"POSHEAD {current_angle:.4f}") # 打印起始角度
+                    print_resp(f"POSHEAD {current_angle:.4f}")
                     
                     time.sleep(0.2) 
                     wait_start = time.time()
-                    # 多圈可能时间很久，超时时间根据圈数动态增加
-                    # 假设最慢 1度/秒，转1圈360秒。这得给够时间。
-                    # 简单估算：每圈给60秒余量，或者直接设个很大的值
                     timeout = 120 + (loops * 60) 
                     
                     completed = False
@@ -423,7 +422,6 @@ def main():
                     while time.time() - wait_start < timeout:
                         s = driver.get_current_state()
                         status = s['status']
-                        # 检查状态是否回到 1 (伺服) 或 0
                         if status in ['1', '0']:
                             time.sleep(0.5)
                             s2 = driver.get_current_state()
