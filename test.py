@@ -23,6 +23,7 @@ class TurntableDriver(ABC):
         self.port = config.get("COMPort")
         self.baud = config.get("Baudrate")
         self.is_connected = False
+        # 初始状态设为 None，强制必须读到数据才算有效
         self.latest_state = {"status": None, "angle": 0.0, "alarm": "0"}
         self.lock = threading.Lock()
         
@@ -33,42 +34,45 @@ class TurntableDriver(ABC):
         self.running = False
 
     @abstractmethod
-    def connect(self) -> bool:
+    def connect(self) -> bool: pass
+
+    @abstractmethod
+    def disconnect_only(self): pass
+
+    @abstractmethod
+    def emergency_stop_and_close(self): pass
+
+    @abstractmethod
+    def cmd_init(self) -> bool: pass
+
+    @abstractmethod
+    def cmd_free(self) -> bool: pass
+
+    @abstractmethod
+    def cmd_stop(self) -> bool: pass
+
+    @abstractmethod
+    def cmd_speed_run(self, acc, speed) -> bool: pass
+
+    @abstractmethod
+    def cmd_position_run(self, dir_code, acc, speed, target_angle) -> bool:
+        """
+        Mode 2: 位置模式
+        dir_code: 0=顺时针, 1=逆时针
+        target_angle: 绝对目标角度 (0-360)
+        """
         pass
 
     @abstractmethod
-    def disconnect_only(self):
-        """正常断开：只关串口，保持电机状态（关键！）"""
+    def cmd_multi_run(self, dir_code, acc, speed, target_angle, loops) -> bool:
+        """
+        Mode 5: 多圈模式
+        loops: 圈数 (0-99)
+        """
         pass
 
     @abstractmethod
-    def emergency_stop_and_close(self):
-        """紧急断开：停车+释放+关串口（用于Ctrl+C）"""
-        pass
-
-    @abstractmethod
-    def cmd_init(self) -> bool:
-        pass
-
-    @abstractmethod
-    def cmd_free(self) -> bool:
-        pass
-
-    @abstractmethod
-    def cmd_stop(self) -> bool:
-        pass
-
-    @abstractmethod
-    def cmd_speed_run(self, acc, speed) -> bool:
-        pass
-
-    @abstractmethod
-    def cmd_position_run(self, acc, speed, angle) -> bool:
-        pass
-
-    @abstractmethod
-    def get_current_state(self):
-        pass
+    def get_current_state(self): pass
 
     def set_output_options(self, print_screen: bool, csv_path: str):
         self.print_screen = print_screen
@@ -121,7 +125,6 @@ class RuyaDriver(TurntableDriver):
             return False
 
     def disconnect_only(self):
-        """ 正常退出：只关串口，不发停车指令 """
         self.running = False
         time.sleep(0.1) 
         if self.ser and self.ser.is_open:
@@ -133,7 +136,6 @@ class RuyaDriver(TurntableDriver):
         self.is_connected = False
 
     def emergency_stop_and_close(self):
-        """ 异常退出：强制停车释放 """
         self.running = False 
         if self.ser and self.ser.is_open:
             try:
@@ -228,32 +230,41 @@ class RuyaDriver(TurntableDriver):
         return False
 
     # --- 接口实现 ---
-    def cmd_init(self) -> bool:
-        return self._send_raw("mo=1")
-
-    def cmd_free(self) -> bool:
-        return self._send_raw("mo=0")
-
-    def cmd_stop(self) -> bool:
-        return self._send_raw("st")
+    def cmd_init(self) -> bool: return self._send_raw("mo=1")
+    def cmd_free(self) -> bool: return self._send_raw("mo=0")
+    def cmd_stop(self) -> bool: return self._send_raw("st")
 
     def cmd_speed_run(self, acc, speed) -> bool:
         if not self._ensure_ready_to_move(): return False
-        
         direction = 0 
         acc_clamped = max(1, min(1000, int(acc)))
         spd_clamped = max(0.0001, min(1000.0, float(speed)))
         cmd = f"3{direction}{acc_clamped:04d}{spd_clamped:09.4f}"
         return self._send_raw(cmd)
 
-    def cmd_position_run(self, acc, speed, angle) -> bool:
+    def cmd_position_run(self, dir_code, acc, speed, target_angle) -> bool:
+        """Mode 2: 标准位置模式"""
         if not self._ensure_ready_to_move(): return False
-
-        direction = 0 
+        
         acc_clamped = max(1, min(1000, int(acc)))
         spd_clamped = max(0.0001, min(1000.0, float(speed)))
-        ang_clamped = float(angle)
-        cmd = f"2{direction}{acc_clamped:04d}{spd_clamped:09.4f}{ang_clamped:08.4f}"
+        ang_clamped = float(target_angle)
+        
+        # 格式: 2{dir}{acc}{spd}{angle}
+        cmd = f"2{dir_code}{acc_clamped:04d}{spd_clamped:09.4f}{ang_clamped:08.4f}"
+        return self._send_raw(cmd)
+
+    def cmd_multi_run(self, dir_code, acc, speed, target_angle, loops) -> bool:
+        """Mode 5: 多圈模式 (New!)"""
+        if not self._ensure_ready_to_move(): return False
+        
+        acc_clamped = max(1, min(1000, int(acc)))
+        spd_clamped = max(0.0001, min(1000.0, float(speed)))
+        ang_clamped = float(target_angle)
+        loops_clamped = max(0, min(99, int(loops))) # 协议限制2位数字 (00-99)
+        
+        # 格式: 5{dir}{acc}{spd}{angle}{loops}
+        cmd = f"5{dir_code}{acc_clamped:04d}{spd_clamped:09.4f}{ang_clamped:08.4f}{loops_clamped:02d}"
         return self._send_raw(cmd)
 
     def get_current_state(self):
@@ -261,7 +272,45 @@ class RuyaDriver(TurntableDriver):
             return self.latest_state.copy()
 
 # ==========================================
-# 3. 主程序逻辑
+# 3. 业务逻辑核心 (Calculation)
+# ==========================================
+def calculate_move_params(current_angle, input_delta):
+    """
+    核心算法：根据当前角度和增量，计算方向、圈数、绝对目标角度
+    """
+    # 1. 确定方向
+    # 增量 > 0: 顺时针(0); 增量 < 0: 逆时针(1)
+    direction = 0 if input_delta >= 0 else 1
+    
+    # 2. 计算绝对增量值
+    abs_delta = abs(input_delta)
+    
+    # 3. 计算圈数 (整数部分)
+    loops = int(abs_delta // 360)
+    
+    # 4. 计算剩余角度 (小数部分)
+    remainder = abs_delta % 360
+    
+    # 5. 计算目标绝对角度
+    # 如果是顺时针，目标 = 当前 + 余数
+    # 如果是逆时针，目标 = 当前 - 余数
+    if direction == 0:
+        target_abs = current_angle + remainder
+    else:
+        target_abs = current_angle - remainder
+        
+    # 6. 归一化目标角度到 [0, 360)
+    # 比如算出来是 370，其实是 10度
+    # 比如算出来是 -30，其实是 330度
+    if target_abs >= 360.0:
+        target_abs -= 360.0
+    elif target_abs < 0.0:
+        target_abs += 360.0
+        
+    return direction, loops, target_abs
+
+# ==========================================
+# 4. 主程序
 # ==========================================
 
 def main():
@@ -270,94 +319,111 @@ def main():
     parser.add_argument("--command", required=True)
     parser.add_argument("--acc", type=float)
     parser.add_argument("--speed", type=float)
-    parser.add_argument("--angle", type=float)
+    parser.add_argument("--angle", type=float) # 注意：这里现在代表“增量”
     parser.add_argument("--printScreen", type=str, default="False")
     parser.add_argument("--SaveCSVFile", type=str)
 
     args = parser.parse_args()
 
-    # 1. 加载配置
+    # Load Config
     try:
-        with open(args.config, 'r', encoding='utf-8') as f:
-            config = json.load(f)
+        with open(args.config, 'r', encoding='utf-8') as f: config = json.load(f)
     except Exception as e:
         print_resp(f"Error loading config: {e}")
         return
 
-    # 2. 实例化
+    # Init Driver
     driver = RuyaDriver(config)
     is_print = args.printScreen.lower() == "true"
     driver.set_output_options(is_print, args.SaveCSVFile)
 
-    # 3. 连接
     if not driver.connect():
         print_resp("Error: Connection Failed")
         return
 
-    # 标记：是否因为异常退出而需要强制清理
     force_cleanup = False
-
-    # 4. 执行
     cmd = args.command
     
     try:
-        # === Init ===
         if cmd == "Init":
             if driver.cmd_init(): print_resp("OK")
             else: print_resp("Error")
 
-        # === Free Mode ===
         elif cmd == "Free Mode":
             if driver.cmd_free(): print_resp("OK")
             else: print_resp("Error")
 
-        # === Stop ===
         elif cmd == "Stop":
             if driver.cmd_stop(): print_resp("OK")
             else: print_resp("Error")
 
-        # === Speed Run (核心修改) ===
         elif cmd == "Speed Run":
             if args.acc is None or args.speed is None:
                 print_resp("Error: Missing params")
             else:
                 if driver.cmd_speed_run(args.acc, args.speed):
                     print_resp("OK")
-                    
-                    # 关键逻辑：
-                    # 如果用户要求 printScreen，我们必须死循环来保持打印，此时退出只能靠 Ctrl+C
                     if is_print:
-                        while True:
-                            time.sleep(0.5)
+                        while True: time.sleep(0.5)
                     else:
-                        # 如果不打印，发完指令直接退出！
-                        # 并且退出时 force_cleanup 为 False，所以不会停止电机
-                        time.sleep(0.5) # 稍微等一下确保指令发完
-                        
+                        time.sleep(0.5)
                 else:
                     print_resp("Error")
 
-        # === Position Run ===
+        # === 核心修改：Position Run 智能逻辑 ===
         elif cmd == "Position Run":
-            force_cleanup = True # 位置模式如果被打断，通常建议停止
+            force_cleanup = True 
             
             if args.acc is None or args.speed is None or args.angle is None:
                 print_resp("Error: Missing params")
             else:
+                # 1. 获取当前状态
                 state = driver.get_current_state()
-                print_resp(f"POSHEAD {state['angle']:.4f}")
+                current_angle = state['angle']
+                input_delta = args.angle
                 
-                if driver.cmd_position_run(args.acc, args.speed, args.angle):
+                print_resp(f"Current: {current_angle:.4f} | Input Delta: {input_delta}")
+                
+                # 2. 计算目标参数
+                # dir_code: 0=CW, 1=CCW
+                # loops: 圈数
+                # target_abs: 0-360的绝对目标位置
+                dir_code, loops, target_abs = calculate_move_params(current_angle, input_delta)
+                
+                print_resp(f"Calc Result -> Dir: {dir_code} (0=CW/1=CCW) | Loops: {loops} | Target Abs: {target_abs:.4f}")
+                
+                # 3. 智能选择指令
+                success = False
+                if loops == 0:
+                    # 圈数为0，使用普通位置模式 (Mode 2)
+                    print_resp("Action: Single Turn Mode (Mode 2)")
+                    success = driver.cmd_position_run(dir_code, args.acc, args.speed, target_abs)
+                else:
+                    # 圈数>0，使用多圈模式 (Mode 5)
+                    # 注意：协议限制最大99圈，如果这里算出100圈，可能需要做限幅或分段
+                    if loops > 99:
+                        print_resp("Warning: Loops > 99, capped at 99 by protocol limit.")
+                    print_resp(f"Action: Multi Turn Mode (Mode 5) - {loops} loops")
+                    success = driver.cmd_multi_run(dir_code, args.acc, args.speed, target_abs, loops)
+
+                # 4. 等待到位逻辑 (通用)
+                if success:
                     print_resp("OK")
+                    print_resp(f"POSHEAD {current_angle:.4f}") # 打印起始角度
                     
                     time.sleep(0.2) 
                     wait_start = time.time()
-                    timeout = 120
+                    # 多圈可能时间很久，超时时间根据圈数动态增加
+                    # 假设最慢 1度/秒，转1圈360秒。这得给够时间。
+                    # 简单估算：每圈给60秒余量，或者直接设个很大的值
+                    timeout = 120 + (loops * 60) 
+                    
                     completed = False
                     
                     while time.time() - wait_start < timeout:
                         s = driver.get_current_state()
                         status = s['status']
+                        # 检查状态是否回到 1 (伺服) 或 0
                         if status in ['1', '0']:
                             time.sleep(0.5)
                             s2 = driver.get_current_state()
@@ -370,29 +436,24 @@ def main():
                         print_resp("Complete")
                         final = driver.get_current_state()
                         print_resp(f"POSTAIL {final['angle']:.4f}")
-                        force_cleanup = False # 正常到位，保持状态退出
+                        force_cleanup = False
                     else:
                         print_resp("Error: Timeout")
                 else:
-                    print_resp("Error")
+                    print_resp("Error: Send command failed")
 
         else:
             print_resp(f"Error: Unknown command")
 
     except KeyboardInterrupt:
         force_cleanup = True
-        # print_resp("Interrupted")
     except Exception as e:
         print_resp(f"Error: {e}")
         force_cleanup = True
     finally:
-        # 5. 退出策略
         if force_cleanup:
-            # 只有在 Ctrl+C 或 出错时，才停车+释放
             driver.emergency_stop_and_close()
         else:
-            # 正常运行结束 (Init, Free, Stop, SpeedRun, PositionRun到位)
-            # 只断开串口，不改变电机状态
             driver.disconnect_only()
 
 if __name__ == "__main__":
