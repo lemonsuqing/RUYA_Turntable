@@ -9,13 +9,13 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 # ==========================================
-# 辅助打印
+# print_resp
 # ==========================================
 def print_resp(msg):
     print(f"> {msg}")
 
 # ==========================================
-# 1. 抽象基类
+# 1. Base Class
 # ==========================================
 class TurntableDriver(ABC):
     def __init__(self, config):
@@ -72,7 +72,7 @@ class TurntableDriver(ABC):
         self.save_csv_path = csv_path
 
 # ==========================================
-# 2. RUYA (如洋) 协议实现
+# 2. RUYA
 # ==========================================
 class RuyaDriver(TurntableDriver):
     def __init__(self, config):
@@ -221,7 +221,7 @@ class RuyaDriver(TurntableDriver):
         print_resp("Error: Failed to ready turntable (Timeout)")
         return False
 
-    # --- 接口实现 ---
+    # --- interface ---
     def cmd_init(self) -> bool: return self._send_raw("mo=1")
     def cmd_free(self) -> bool: return self._send_raw("mo=0")
     def cmd_stop(self) -> bool: return self._send_raw("st")
@@ -263,7 +263,7 @@ class RuyaDriver(TurntableDriver):
             return self.latest_state.copy()
 
 # ==========================================
-# 3. 业务逻辑核心 (Calculation)
+# 3. Calculation
 # ==========================================
 def calculate_move_params(current_angle, input_delta):
     direction = 0 if input_delta >= 0 else 1
@@ -284,7 +284,7 @@ def calculate_move_params(current_angle, input_delta):
     return direction, loops, target_abs
 
 # ==========================================
-# 4. 主程序
+# 4. main
 # ==========================================
 
 def main():
