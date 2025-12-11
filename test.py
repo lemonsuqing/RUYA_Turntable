@@ -235,7 +235,8 @@ class RuyaDriver(TurntableDriver):
 
     def cmd_speed_run(self, acc, speed) -> bool:
         if not self._ensure_ready_to_move(): return False
-        direction = 0 
+        direction = 0 if speed >= 0 else 1
+        speed = abs(speed)
         acc_clamped = max(1, min(1000, int(acc)))
         spd_clamped = max(0.0001, min(1000.0, float(speed)))
         cmd = f"3{direction}{acc_clamped:04d}{spd_clamped:09.4f}"
